@@ -219,6 +219,13 @@ class Gassy {
     if (children.find(name) != children.end())
       return -EEXIST;
 
+    /*
+     * One reference for the name and one for the kernel inode cache. This
+     * call also opens a file handle to the new file. However, it appears that
+     * open does not take a reference on the in-kernel inode, so we shouldn't
+     * need one here. The scenario that is of interest is removing a file that
+     * is open.
+     */
     Inode *in = new Inode(next_ino_++);
     in->get();
 
@@ -276,6 +283,8 @@ class Gassy {
     assert(in);
     std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
     in->i_st.st_ctime = now;
+
+    in->i_st.st_nlink--;
 
     symlinks_.erase(it->second);
     children.erase(it);
@@ -709,42 +718,30 @@ class Gassy {
     return 0;
   }
 
-  int Mknod(fuse_ino_t parent_ino, const std::string& name, mode_t mode,
-      dev_t rdev, struct stat *st, uid_t uid, gid_t gid)
-  {
+  int Link(fuse_ino_t ino, fuse_ino_t newparent_ino, const std::string& newname,
+      struct stat *st, uid_t uid, gid_t gid) {
     std::lock_guard<std::mutex> l(mutex_);
 
-    assert(0);
-
-    if (name.length() >= PATH_MAX)
+    if (newname.length() >= PATH_MAX)
       return -ENAMETOOLONG;
 
-    assert(children_.find(parent_ino) != children_.end());
-    dir_t& children = children_.at(parent_ino);
-    if (children.find(name) != children.end())
+    assert(children_.find(newparent_ino) != children_.end());
+    dir_t& children = children_.at(newparent_ino);
+    if (children.find(newname) != children.end())
       return -EEXIST;
 
-    Inode *in = new Inode(next_ino_++);
-    in->get();
+    Inode *in = inode_get(ino);
+    assert(in);
 
-    children[name] = in->ino();
-    ino_to_inode_[in->ino()] = in;
+    if (in->i_st.st_mode & S_IFDIR)
+      return -EPERM;
 
-    assert(mode & S_IFIFO);
+    in->get(); // for newname
+    in->get(); // for kernel inode cache
 
-    in->i_st.st_ino = in->ino();
-    in->i_st.st_mode = mode;
-    in->i_st.st_nlink = 1;
-    in->i_st.st_blksize = 4096;
-    in->i_st.st_uid = uid;
-    in->i_st.st_gid = gid;
-    std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-    in->i_st.st_atime = now;
-    in->i_st.st_mtime = now;
-    in->i_st.st_ctime = now;
-#if 0
-    in->i_st.st_birthtime = now;
-#endif
+    in->i_st.st_nlink++;
+
+    children[newname] = in->ino();
 
     *st = in->i_st;
 
@@ -1073,8 +1070,8 @@ static void ll_statfs(fuse_req_t req, fuse_ino_t ino)
     fuse_reply_err(req, -ret);
 }
 
-static void ll_mknod(fuse_req_t req, fuse_ino_t parent, const char *name,
-    mode_t mode, dev_t rdev)
+static void ll_link(fuse_req_t req, fuse_ino_t ino, fuse_ino_t newparent,
+    const char *newname)
 {
   Gassy *fs = (Gassy*)fuse_req_userdata(req);
   const struct fuse_ctx *ctx = fuse_req_ctx(req);
@@ -1082,7 +1079,7 @@ static void ll_mknod(fuse_req_t req, fuse_ino_t parent, const char *name,
   struct fuse_entry_param fe;
   memset(&fe, 0, sizeof(fe));
 
-  int ret = fs->Mknod(parent, name, mode, rdev, &fe.attr, ctx->uid, ctx->gid);
+  int ret = fs->Link(ino, newparent, newname, &fe.attr, ctx->uid, ctx->gid);
   if (ret == 0) {
     fe.ino = fe.attr.st_ino;
     fuse_reply_entry(req, &fe);
@@ -1140,7 +1137,7 @@ int main(int argc, char *argv[])
   ll_oper.fsync       = ll_fsync;
   ll_oper.fsyncdir    = ll_fsyncdir;
   ll_oper.statfs      = ll_statfs;
-  ll_oper.mknod       = ll_mknod;
+  ll_oper.link        = ll_link;
 
   BlockAllocator *ba = new BlockAllocator(segments, gasnet_nodes());
   Gassy *fs = new Gassy(ba);
@@ -1176,8 +1173,8 @@ int main(int argc, char *argv[])
   // not a huge priority
 	void (*init) (void *userdata, struct fuse_conn_info *conn);
 	void (*destroy) (void *userdata);
-	void (*link) (fuse_req_t req, fuse_ino_t ino, fuse_ino_t newparent,
-		      const char *newname);
+static void ll_mknod(fuse_req_t req, fuse_ino_t parent, const char *name,
+    mode_t mode, dev_t rdev)
 	void (*opendir) (fuse_req_t req, fuse_ino_t ino,
 			 struct fuse_file_info *fi);
 	void (*releasedir) (fuse_req_t req, fuse_ino_t ino,
